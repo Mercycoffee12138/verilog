@@ -393,7 +393,7 @@ mem控制信号解包的逻辑也应该更改（这里解包的顺序记得遵�
 
 ### 3.4.2 写
 
-这里我们选择增加SWL指令，它的功能是：
+这里我们选择增加写入内存后四位的半位写入逻辑指令，它的功能是：
 
 **decode.v**
 
@@ -469,30 +469,30 @@ assign {inst_load,inst_store,ls_word,is_half,swl_type,lb_sign} = mem_control;
 然后，修改写入逻辑
 
 ```verilog
-   always @ (*)
-begin
-    if (swl_type) begin  // SWL指令特殊处理
-        case (dm_addr[1:0])
-            2'b00   : dm_wdata <= {store_data[7:0], 24'd0};
-            2'b01   : dm_wdata <= {store_data[15:0], 16'd0};
-            2'b10   : dm_wdata <= {store_data[23:0], 8'd0};
-            2'b11   : dm_wdata <= store_data;
-            default : dm_wdata <= store_data;
-        endcase
+  always @ (*)
+    begin
+        if (swl_type) begin  // SWL指令特殊处理 - 修改为后四位
+            case (dm_addr[1:0])
+                2'b00   : dm_wdata = store_data;
+                2'b01   : dm_wdata = {8'd0, store_data[31:8]};
+                2'b10   : dm_wdata = {16'd0, store_data[31:16]};
+                2'b11   : dm_wdata = {24'd0, store_data[31:24]};
+                default : dm_wdata = store_data;
+            endcase
+        end
+        else if (ls_word) begin  // SW指令直接存储整个32位数据
+            dm_wdata = store_data;  // SW指令忽略地址偏移，直接存储整个数据
+        end
+        else begin  // SB指令按字节重组数据
+            case (dm_addr[1:0])
+                2'b00   : dm_wdata = store_data;                    // 保持原样
+                2'b01   : dm_wdata = {16'd0, store_data[7:0], 8'd0};
+                2'b10   : dm_wdata = {8'd0, store_data[7:0], 16'd0};
+                2'b11   : dm_wdata = {store_data[7:0], 24'd0};
+                default : dm_wdata = store_data;
+            endcase
+        end
     end
-    else if (ls_word) begin  // SW指令：直接存储完整的32位数据
-        dm_wdata <= store_data;  // SW指令不管地址偏移，都存储完整数据
-    end
-    else begin  // SB指令：按字节组织数据
-        case (dm_addr[1:0])
-            2'b00   : dm_wdata <= store_data;                    // 保持原样
-            2'b01   : dm_wdata <= {16'd0, store_data[7:0], 8'd0};
-            2'b10   : dm_wdata <= {8'd0, store_data[7:0], 16'd0};
-            2'b11   : dm_wdata <= {store_data[7:0], 24'd0};
-            default : dm_wdata <= store_data;
-        endcase
-    end
-end
 ```
 
 修改写使能逻辑
@@ -500,32 +500,33 @@ end
 ```verilog
     always @ (*)    
     begin
+        // 确保MEM_valid稳定且为store指令时才产生写使能
         if (MEM_valid && inst_store) 
         begin
-            if (swl_type) begin  // SWL指令的写使能
+            if (swl_type) begin  // SWL指令的写使能 - 修改为后四位
                 case (dm_addr[1:0])
-                    2'b00   : dm_wen <= 4'b1000;  // 只写最高字节
-                    2'b01   : dm_wen <= 4'b1100;  // 写高2字节
-                    2'b10   : dm_wen <= 4'b1110;  // 写高3字节
-                    2'b11   : dm_wen <= 4'b1111;  // 写全部4字节
-                    default : dm_wen <= 4'b0000;
+                    2'b00   : dm_wen = 4'b1111;  // 写全部4字节
+                    2'b01   : dm_wen = 4'b0111;  // 写低3字节
+                    2'b10   : dm_wen = 4'b0011;  // 写低2字节
+                    2'b11   : dm_wen = 4'b0001;  // 只写最低字节
+                    default : dm_wen = 4'b0000;
                 endcase
             end
             else if (ls_word) begin
-                dm_wen <= 4'b1111; // SW指令：写使能全1
+                dm_wen = 4'b1111; // SW指令写使能全1
             end
-            else begin // SB指令：原有逻辑
+            else begin // SB指令原有逻辑
                 case (dm_addr[1:0])
-                    2'b00   : dm_wen <= 4'b0001;
-                    2'b01   : dm_wen <= 4'b0010;
-                    2'b10   : dm_wen <= 4'b0100;
-                    2'b11   : dm_wen <= 4'b1000;
-                    default : dm_wen <= 4'b0000;
+                    2'b00   : dm_wen = 4'b0001;
+                    2'b01   : dm_wen = 4'b0010;
+                    2'b10   : dm_wen = 4'b0100;
+                    2'b11   : dm_wen = 4'b1000;
+                    default : dm_wen = 4'b0000;
                 endcase
             end
         end
         else begin
-            dm_wen <= 4'b0000;
+            dm_wen = 4'b0000;
         end
     end
 ```
@@ -876,17 +877,17 @@ AC010002
 我们的思路是先将mem[2]变为`ffffabcd`，再利用写入高半位指令LHU将上四位变为0.
 
 ```asm
-addiu  $s1,$s0,ABCD		->$s1=ffffabcd
-addiui $s2,$s0,7BCD		->$s2=00007BCD
-SW	   $S1,2($s0)		->MEM[2]=FFFFABCD
-SWL	   $s2,2($s0)		->MEM[2]=0000ABCD
+addiu  $s1,$s0,ABCD		->$s1=00000001
+addiui $s2,$s0,7BCD		->$s2=FFFFABCD
+SW	   $S1,2($s0)		->MEM[2]=00000001
+SWL	   $s2,2($s0)		->MEM[2]=0000FFFF
 ```
 
 接着我们来编写机器码：
 
 ```
-2401ABCD
-24027BCD
+24010001
+2402ABCD
 AC010002
 A8020002
 ```
@@ -895,9 +896,9 @@ A8020002
 
 ![SWL](D:\Desktop\计算机组成原理\实验\lab6\SWL.png)
 
-​	我们看到了实验结果却是和我们预想的一样，在进行半位写入之后变为了`0000abcd`。到此我们所有的指令都已经添加成功了。
+​	我们看到了实验结果却是和我们预想的一样，之前我们写入了`00000001`，在进行半位写入之后变为了`0000ffff`。到此我们所有的指令都已经添加成功了。
 
-# 六、总结感想
+# 七、总结感想
 
 ​	本次五级流水线CPU的实验，是一次全面而深刻的计算机组成原理实践。通过亲手分析和修改五级流水线的源码，我对CPU内部的复杂工作机制、指令执行的精妙流程以及流水线设计中的关键问题有了更为具体和深入的理解。
 
@@ -909,8 +910,4 @@ A8020002
 
 ​	仿真验证环节同样不可或缺。通过编写汇编代码、转换为机器码、进行波形仿真，并仔细分析`$s1`、`$s2`、`$s3`、`HI_data`、`LO_data`、`$31`寄存器以及内存单元`mem[2]`的值，确保了每一条新增指令的功能都符合预期。这个过程不仅锻炼了我的调试能力，也让我学会了如何通过具体的测试用例来验证设计的正确性。
 
-总的来说，这次实验让我从理论走向实践，深刻体会了CPU设计中的细节与挑战。从指令解码、执行到访存、写回，再到流水线控制和冒险处理，每一个环节都充满了值得学习的知识。
-
-​	这学期的计算机组成原理到此就告一段落了。
-
-本人代码均在github：[Mercycoffee12138/verilog](https://github.com/Mercycoffee12138/verilog)
+​	总的来说，这次实验让我从理论走向实践，深刻体会了CPU设计中的细节与挑战。从指令解码、执行到访存、写回，再到流水线控制和冒险处理，每一个环节都充满了值得学习的知识。虽然过程复杂，但成功实现功能并验证通过后，成就感油然而生。这次实验不仅巩固了课堂所学的理论知识，更提升了我的硬件设计和调试能力，为后续更复杂的数字系统设计打下了坚实的基础。
